@@ -133,13 +133,11 @@ int main(int argc, char *argv[])
         std::exit(EXIT_FAILURE);
     }
 
-    int res = 0;
     while (av_read_frame(fmtCtx, packet) >= 0) {
         if (packet->stream_index == audioStreamIndex) {
             spdlog::get("stdout")->info("AVPacket->pts: {}", packet->pts);
             std::vector<std::vector<uint8_t>> data;
-            res = decodePacket(packet, codecCtx, frame, data);
-            if (res < 0) {
+            if (decodePacket(packet, codecCtx, frame, data) < 0) {
                 break;
             }
         }
