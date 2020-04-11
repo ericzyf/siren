@@ -13,4 +13,5 @@ target_link_libraries(siren
     -lavcodec
     -lavutil
     -lfmt
+    -lrtaudio
 )

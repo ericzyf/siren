@@ -4,11 +4,13 @@ extern "C" {
 }
 
 #include <fmt/format.h>
+#include <rtaudio/RtAudio.h>
 #include <spdlog/spdlog.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
 
 #include <cinttypes>
 #include <cstdlib>
+#include <iostream>
 #include <vector>
 
 int decodePacket(AVPacket *packet,
@@ -53,6 +55,98 @@ int decodePacket(AVPacket *packet,
     }
 
     return 0;
+}
+
+int RtAudioCb(void *outputBuffer,
+         void *inputBuffer,
+         unsigned int nFrames,
+         double streamTime,
+         RtAudioStreamStatus status,
+         void *userData)
+{
+    typedef struct {
+        void *data;
+        unsigned offset;
+        int numChannels;
+        bool isPlanarAudio;
+        size_t bytesPerSample;
+    } RtAudioCbCtx;
+
+    auto ctx = (RtAudioCbCtx*)userData;
+
+    if (status) {
+        spdlog::get("stdout")->info("Stream underflow detected");
+    }
+
+    auto buffer = (uint8_t*)(outputBuffer);
+
+    auto dataVec = (std::vector<std::vector<uint8_t>>*)(ctx->data);
+    auto offset = ctx->offset;
+    auto numChannels = ctx->numChannels;
+    auto isPlanarAudio = ctx->isPlanarAudio;
+    auto bytesPerSample = ctx->bytesPerSample;
+
+    auto lineSize = (*dataVec)[0].size();
+
+    if (offset >= lineSize) {
+        spdlog::get("stdout")->info("End of stream");
+        return 1;
+    }
+
+    if (isPlanarAudio) {
+        auto remainingBytes = lineSize - offset;
+        decltype(nFrames) remainingFrames = remainingBytes / bytesPerSample;
+        auto maxNumFrames = std::min(nFrames, remainingFrames);
+
+        // transform to interleaved data
+        for (decltype(maxNumFrames) i = 0; i < maxNumFrames; ++i) {
+            for (int ch = 0; ch < numChannels; ++ch) {
+                memcpy(buffer, (*dataVec)[ch].data() + offset, bytesPerSample);
+                buffer += bytesPerSample;
+            }
+            offset += bytesPerSample;
+        }
+        ctx->offset = offset;
+    } else {
+        auto framesSize = numChannels * bytesPerSample * nFrames;
+        decltype(framesSize) remainingBytes = lineSize - offset;
+        auto numBytesToWrite = std::min(framesSize, remainingBytes);
+
+        memcpy(buffer, (*dataVec)[0].data() + offset, numBytesToWrite);
+        ctx->offset += numBytesToWrite;
+    }
+
+    return 0;
+}
+
+bool getRtAudioFormat(const AVCodecParameters *codecParams, RtAudioFormat &fmt)
+{
+    switch (codecParams->format) {
+
+    case AV_SAMPLE_FMT_S16:
+    case AV_SAMPLE_FMT_S16P:
+        fmt = RTAUDIO_SINT16;
+        return true;
+
+    case AV_SAMPLE_FMT_S32:
+    case AV_SAMPLE_FMT_S32P:
+        fmt = RTAUDIO_SINT32;
+        return true;
+
+    case AV_SAMPLE_FMT_FLT:
+    case AV_SAMPLE_FMT_FLTP:
+        fmt = RTAUDIO_FLOAT32;
+        return true;
+
+    case AV_SAMPLE_FMT_DBL:
+    case AV_SAMPLE_FMT_DBLP:
+        fmt = RTAUDIO_FLOAT64;
+        return true;
+
+    default:
+        return false;
+
+    }
 }
 
 int main(int argc, char *argv[])
@@ -133,6 +227,9 @@ int main(int argc, char *argv[])
         std::exit(EXIT_FAILURE);
     }
 
+    const bool isPlanarAudio = av_sample_fmt_is_planar(codecCtx->sample_fmt);
+    int numLines = isPlanarAudio ? codecCtx->channels : 1;
+    std::vector<std::vector<uint8_t>> audio(numLines);
     while (av_read_frame(fmtCtx, packet) >= 0) {
         if (packet->stream_index == audioStreamIndex) {
             spdlog::get("stdout")->info("AVPacket->pts: {}", packet->pts);
@@ -140,8 +237,75 @@ int main(int argc, char *argv[])
             if (decodePacket(packet, codecCtx, frame, data) < 0) {
                 break;
             }
+            for (int i = 0; i < numLines; ++i) {
+                audio[i].insert(audio[i].end(), data[i].begin(), data[i].end());
+            }
         }
         av_packet_unref(packet);
+    }
+
+    // init RtAudio
+    spdlog::get("stdout")->debug("Initializing RtAudio");
+
+    RtAudio dac(RtAudio::LINUX_PULSE);
+    if (dac.getDeviceCount() < 1) {
+        spdlog::get("stderr")->error("No audio devices found");
+        std::exit(EXIT_FAILURE);
+    }
+
+    RtAudio::StreamParameters streamParams;
+    streamParams.deviceId = dac.getDefaultOutputDevice();
+    streamParams.nChannels = codecParams->channels;
+
+    RtAudioFormat audioFmt;
+    if (!getRtAudioFormat(codecParams, audioFmt)) {
+        spdlog::get("stderr")->error("RtAudio error: unsupported audio format");
+        std::exit(EXIT_FAILURE);
+    }
+
+    unsigned sampleRate = codecParams->sample_rate;
+    unsigned bufferFrames = 256;
+
+    spdlog::get("stdout")->debug("nChannels: {}", streamParams.nChannels);
+    spdlog::get("stdout")->debug("sampleRate: {}", sampleRate);
+    spdlog::get("stdout")->debug("bufferFrames: {}", bufferFrames);
+
+    typedef struct {
+        void *data;
+        unsigned offset;
+        int numChannels;
+        bool isPlanarAudio;
+        size_t bytesPerSample;
+    } RtAudioCbCtx;
+
+    RtAudioCbCtx ctx = {
+        &audio,
+        0,
+        codecParams->channels,
+        isPlanarAudio,
+        (size_t)av_get_bytes_per_sample(codecCtx->sample_fmt)
+    };
+
+    try {
+        dac.openStream(&streamParams, nullptr, audioFmt, sampleRate, &bufferFrames, RtAudioCb, &ctx);
+        dac.startStream();
+    } catch (RtAudioError &e) {
+        e.printMessage();
+        std::exit(EXIT_FAILURE);
+    }
+
+    fmt::print("Playing ... press <Enter> to quit\n");
+    char input;
+    std::cin.get(input);
+
+    try {
+        dac.stopStream();
+    } catch (RtAudioError &e) {
+        e.printMessage();
+    }
+
+    if (dac.isStreamOpen()) {
+        dac.closeStream();
     }
 
     spdlog::get("stdout")->debug("Releasing resources");
