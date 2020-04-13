@@ -104,8 +104,8 @@ int RtAudioCb(void *outputBuffer,
                 const int bytesPerSample = av_get_bytes_per_sample(ctx->codecCtx->sample_fmt);
 
                 if (isPlanarAudio) {
+                    std::vector<uint8_t> currSample(ctx->numChannels * bytesPerSample);
                     for (unsigned offset = 0; offset < packetData[0].size(); offset += bytesPerSample) {
-                        std::vector<uint8_t> currSample(ctx->numChannels * bytesPerSample);
                         auto pSample = currSample.data();
 
                         for (int ch = 0; ch < ctx->numChannels; ++ch) {
@@ -118,8 +118,8 @@ int RtAudioCb(void *outputBuffer,
                 } else {
                     // data is already interleaved
                     auto step = ctx->numChannels * bytesPerSample;
+                    std::vector<uint8_t> currSample(step);
                     for (unsigned offset = 0; offset < packetData[0].size(); offset += step) {
-                        std::vector<uint8_t> currSample(step);
                         memcpy(currSample.data(), packetData[0].data() + offset, step);
                         ctx->frameQueue->emplace(currSample);
                     }
