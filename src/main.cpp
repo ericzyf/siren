@@ -11,7 +11,18 @@ extern "C" {
 #include <cinttypes>
 #include <cstdlib>
 #include <iostream>
+#include <queue>
 #include <vector>
+
+struct RtAudioCbCtx {
+    AVCodecContext *codecCtx;
+    AVFormatContext *fmtCtx;
+    AVPacket *packet;
+    AVFrame *frame;
+    std::queue<std::vector<uint8_t>> *frameQueue;
+    int audioStreamIndex;
+    int numChannels;
+};
 
 int decodePacket(AVPacket *packet,
                  AVCodecContext *codecCtx,
@@ -64,14 +75,6 @@ int RtAudioCb(void *outputBuffer,
          RtAudioStreamStatus status,
          void *userData)
 {
-    typedef struct {
-        void *data;
-        unsigned offset;
-        int numChannels;
-        bool isPlanarAudio;
-        size_t bytesPerSample;
-    } RtAudioCbCtx;
-
     auto ctx = (RtAudioCbCtx*)userData;
 
     if (status) {
@@ -80,40 +83,55 @@ int RtAudioCb(void *outputBuffer,
 
     auto buffer = (uint8_t*)(outputBuffer);
 
-    auto dataVec = (std::vector<std::vector<uint8_t>>*)(ctx->data);
-    auto offset = ctx->offset;
-    auto numChannels = ctx->numChannels;
-    auto isPlanarAudio = ctx->isPlanarAudio;
-    auto bytesPerSample = ctx->bytesPerSample;
+    while (ctx->frameQueue->size() < nFrames) {
+        if (av_read_frame(ctx->fmtCtx, ctx->packet) >= 0) {
+            if (ctx->packet->stream_index == ctx->audioStreamIndex) {
+                spdlog::get("stdout")->info("AVPacket->pts: {}", ctx->packet->pts);
+                std::vector<std::vector<uint8_t>> packetData;
+                if (decodePacket(ctx->packet, ctx->codecCtx, ctx->frame, packetData) < 0) {
+                    // error occurred
+                    return 1;
+                }
 
-    auto lineSize = (*dataVec)[0].size();
+                const bool isPlanarAudio = av_sample_fmt_is_planar(ctx->codecCtx->sample_fmt);
+                const int bytesPerSample = av_get_bytes_per_sample(ctx->codecCtx->sample_fmt);
 
-    if (offset >= lineSize) {
-        spdlog::get("stdout")->info("End of stream");
-        return 1;
+                if (isPlanarAudio) {
+                    for (unsigned offset = 0; offset < packetData[0].size(); offset += bytesPerSample) {
+                        std::vector<uint8_t> currSample(ctx->numChannels * bytesPerSample);
+                        auto pSample = currSample.data();
+
+                        for (int ch = 0; ch < ctx->numChannels; ++ch) {
+                            memcpy(pSample, packetData[ch].data() + offset, bytesPerSample);
+                            pSample += bytesPerSample;
+                        }
+
+                        ctx->frameQueue->emplace(currSample);
+                    }
+                } else {
+                    // data is already interleaved
+                    auto step = ctx->numChannels * bytesPerSample;
+                    for (unsigned offset = 0; offset < packetData[0].size(); offset += step) {
+                        std::vector<uint8_t> currSample(step);
+                        memcpy(currSample.data(), packetData[0].data() + offset, step);
+                        ctx->frameQueue->emplace(currSample);
+                    }
+                }
+            }
+        } else {
+            spdlog::get("stdout")->info("End of stream");
+            return 1;
+        }
     }
 
-    if (isPlanarAudio) {
-        auto remainingBytes = lineSize - offset;
-        decltype(nFrames) remainingFrames = remainingBytes / bytesPerSample;
-        auto maxNumFrames = std::min(nFrames, remainingFrames);
-
-        // transform to interleaved data
-        for (decltype(maxNumFrames) i = 0; i < maxNumFrames; ++i) {
-            for (int ch = 0; ch < numChannels; ++ch) {
-                memcpy(buffer, (*dataVec)[ch].data() + offset, bytesPerSample);
-                buffer += bytesPerSample;
-            }
-            offset += bytesPerSample;
-        }
-        ctx->offset = offset;
-    } else {
-        auto framesSize = numChannels * bytesPerSample * nFrames;
-        decltype(framesSize) remainingBytes = lineSize - offset;
-        auto numBytesToWrite = std::min(framesSize, remainingBytes);
-
-        memcpy(buffer, (*dataVec)[0].data() + offset, numBytesToWrite);
-        ctx->offset += numBytesToWrite;
+    // have enough audio frames in the frameQueue
+    // write $nFrames frames to outputBuffer
+    unsigned maxNumFrames = std::min(nFrames, (unsigned)(ctx->frameQueue->size()));
+    for (unsigned i = 0; i < nFrames; ++i) {
+        const auto &frame = ctx->frameQueue->front();
+        memcpy(buffer, frame.data(), frame.size());
+        buffer += frame.size();
+        ctx->frameQueue->pop();
     }
 
     return 0;
@@ -227,23 +245,6 @@ int main(int argc, char *argv[])
         std::exit(EXIT_FAILURE);
     }
 
-    const bool isPlanarAudio = av_sample_fmt_is_planar(codecCtx->sample_fmt);
-    int numLines = isPlanarAudio ? codecCtx->channels : 1;
-    std::vector<std::vector<uint8_t>> audio(numLines);
-    while (av_read_frame(fmtCtx, packet) >= 0) {
-        if (packet->stream_index == audioStreamIndex) {
-            spdlog::get("stdout")->info("AVPacket->pts: {}", packet->pts);
-            std::vector<std::vector<uint8_t>> data;
-            if (decodePacket(packet, codecCtx, frame, data) < 0) {
-                break;
-            }
-            for (int i = 0; i < numLines; ++i) {
-                audio[i].insert(audio[i].end(), data[i].begin(), data[i].end());
-            }
-        }
-        av_packet_unref(packet);
-    }
-
     // init RtAudio
     spdlog::get("stdout")->debug("Initializing RtAudio");
 
@@ -270,20 +271,16 @@ int main(int argc, char *argv[])
     spdlog::get("stdout")->debug("sampleRate: {}", sampleRate);
     spdlog::get("stdout")->debug("bufferFrames: {}", bufferFrames);
 
-    typedef struct {
-        void *data;
-        unsigned offset;
-        int numChannels;
-        bool isPlanarAudio;
-        size_t bytesPerSample;
-    } RtAudioCbCtx;
+    std::queue<std::vector<uint8_t>> frameQueue;
 
     RtAudioCbCtx ctx = {
-        &audio,
-        0,
-        codecParams->channels,
-        isPlanarAudio,
-        (size_t)av_get_bytes_per_sample(codecCtx->sample_fmt)
+        codecCtx,
+        fmtCtx,
+        packet,
+        frame,
+        &frameQueue,
+        audioStreamIndex,
+        codecParams->channels
     };
 
     try {
