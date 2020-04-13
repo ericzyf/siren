@@ -121,6 +121,17 @@ int RtAudioCb(void *outputBuffer,
                 }
             }
         } else {
+            if (ctx->frameQueue->size() != 0) {
+                // end of stream
+                // write remaining audio frames in frameQueue to outputBuffer
+                auto numRemFrames = ctx->frameQueue->size();
+                for (unsigned i = 0; i < numRemFrames; ++i) {
+                    const auto &frame = ctx->frameQueue->front();
+                    memcpy(buffer, frame.data(), frame.size());
+                    buffer += frame.size();
+                    ctx->frameQueue->pop();
+                }
+            }
             spdlog::get("stdout")->info("End of stream");
             return 1;
         }
