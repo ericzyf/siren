@@ -52,19 +52,24 @@ int decodePacket(AVPacket *packet,
             return res;
         }
 
-        int numLines = isPlanarAudio ? codecCtx->channels : 1;
-        for (int i = 0; i < numLines; ++i) {
-            data.emplace_back(frame->data[i], frame->data[i] + frame->linesize[0]);
+        if (isPlanarAudio) {
+            auto lineSize = frame->nb_samples * bytesPerSample;
+            for (int i = 0; i < codecCtx->channels; ++i) {
+                data.emplace_back(frame->data[i], frame->data[i] + lineSize);
+            }
+        } else {
+            data.emplace_back(frame->data[0], frame->data[0] + frame->linesize[0]);
+        }
 
 #ifndef NDEBUG
-            spdlog::get("stdout")->debug("AVFrame->data[{}]", i);
-            for (int j = 0; j < frame->linesize[0]; ++j) {
-                fmt::print("{:02x} ", frame->data[i][j]);
+        for (const auto &row : data) {
+            for (const auto &sample : row) {
+                fmt::print("{:02x} ", sample);
             }
             fmt::print("\n");
+        }
 #endif
 
-        }
     }
 
     return 0;
