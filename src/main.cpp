@@ -1,6 +1,8 @@
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
+
+#include <unistd.h>
 }
 
 #include <fmt/format.h>
@@ -167,19 +169,76 @@ bool getRtAudioFormat(const AVCodecParameters *codecParams, RtAudioFormat &fmt)
     }
 }
 
+struct args_t {
+    int verbosity;
+    int sampleRate;
+    const char *audioPath;
+};
+
+static void printHelp(const args_t &args)
+{
+    fmt::print("Usage:\n");
+    fmt::print("\n");
+    fmt::print("  siren [options] <path-to-audio>\n");
+    fmt::print("\n");
+    fmt::print("\n");
+    fmt::print("Options:\n");
+    fmt::print("\n");
+    fmt::print("  -h  =  help\n");
+    fmt::print("  -v <int> (default: {})  =  verbosity\n", args.verbosity);
+    fmt::print("    trace={}\n", (int)spdlog::level::trace);
+    fmt::print("    debug={}\n", (int)spdlog::level::debug);
+    fmt::print("    info={}\n", (int)spdlog::level::info);
+    fmt::print("    warn={}\n", (int)spdlog::level::warn);
+    fmt::print("    error={}\n", (int)spdlog::level::err);
+    fmt::print("    critical={}\n", (int)spdlog::level::critical);
+    fmt::print("    off={}\n", (int)spdlog::level::off);
+    fmt::print("  -s <int> (default: {})  =  sample rate\n", args.sampleRate);
+}
+
 int main(int argc, char *argv[])
 {
+    args_t ARGS = {
+        .verbosity = spdlog::level::info,
+        .sampleRate = 44100,
+        .audioPath = nullptr
+    };
+
+    // parse args
+    if (argc == 1) {
+        printHelp(ARGS);
+        return 0;
+    }
+
+    opterr = 0;
+    int c;
+    while ((c = getopt(argc, argv, "hv:s:")) != -1) {
+        switch (c) {
+        case 'h':
+            printHelp(ARGS);
+            return 0;
+        case 'v':
+            ARGS.verbosity = std::atoi(optarg);
+            break;
+        case 's':
+            ARGS.sampleRate = std::atoi(optarg);
+            break;
+        }
+    }
+    if (!argv[optind]) {
+        fmt::print("Missing path to audio file\n");
+        std::exit(EXIT_FAILURE);
+    } else {
+        ARGS.audioPath = argv[optind];
+    }
+    // finish parsing args
+    //////////////////////
+
     auto spdlog_stdout = spdlog::stdout_color_st("stdout");
     auto spdlog_stderr = spdlog::stderr_color_st("stderr");
 
-    spdlog_stdout->set_level(spdlog::level::debug);
-    spdlog_stderr->set_level(spdlog::level::debug);
-
-    if (argc < 2) {
-        fmt::print("Usage:\n\n");
-        fmt::print("  siren <path-to-audio>\n");
-        return 0;
-    }
+    spdlog_stdout->set_level((spdlog::level::level_enum)ARGS.verbosity);
+    spdlog_stderr->set_level((spdlog::level::level_enum)ARGS.verbosity);
 
     AVFormatContext *fmtCtx = avformat_alloc_context();
     if (!fmtCtx) {
@@ -187,8 +246,8 @@ int main(int argc, char *argv[])
         std::exit(EXIT_FAILURE);
     }
 
-    if (avformat_open_input(&fmtCtx, argv[1], nullptr, nullptr)) {
-        spdlog::get("stderr")->error("Could not open file \"{}\"", argv[1]);
+    if (avformat_open_input(&fmtCtx, ARGS.audioPath, nullptr, nullptr)) {
+        spdlog::get("stderr")->error("Could not open file \"{}\"", ARGS.audioPath);
         std::exit(EXIT_FAILURE);
     }
 
@@ -264,7 +323,7 @@ int main(int argc, char *argv[])
         std::exit(EXIT_FAILURE);
     }
 
-    unsigned sampleRate = codecParams->sample_rate;
+    unsigned sampleRate = ARGS.sampleRate;
     unsigned bufferFrames = 256;
 
     spdlog::get("stdout")->debug("nChannels: {}", streamParams.nChannels);
