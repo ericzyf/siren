@@ -125,6 +125,7 @@ int RtAudioCb(void *outputBuffer,
                     }
                 }
             }
+            av_packet_unref(ctx->packet);
         } else {
             if (ctx->frameQueue->size() != 0) {
                 // end of stream
