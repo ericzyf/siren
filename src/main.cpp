@@ -95,9 +95,19 @@ int RtAudioCb(void *outputBuffer,
             if (ctx->packet->stream_index == ctx->audioStreamIndex) {
                 spdlog::get("stdout")->info("AVPacket->pts: {}", ctx->packet->pts);
                 std::vector<std::vector<uint8_t>> packetData;
-                if (decodePacket(ctx->packet, ctx->codecCtx, ctx->frame, packetData) < 0) {
+                int ret = decodePacket(ctx->packet, ctx->codecCtx, ctx->frame, packetData);
+                if (ret < 0) {
                     // error occurred
-                    return 1;
+                    if (ret != AVERROR(EAGAIN) &&
+                        ret != AVERROR_EOF &&
+                        ret != AVERROR(EINVAL) &&
+                        ret != AVERROR(ENOMEM)) {
+                        // cannot decode this packet, skip it
+                        av_packet_unref(ctx->packet);
+                        continue;
+                    } else {
+                        return 1;
+                    }
                 }
 
                 const bool isPlanarAudio = av_sample_fmt_is_planar(ctx->codecCtx->sample_fmt);
