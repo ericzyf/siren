@@ -226,6 +226,50 @@ static void printHelp(const args_t &args)
     fmt::print("  -s <int> (default: {})  =  sample rate\n", args.sampleRate);
 }
 
+const char *RtAudioApiToString(RtAudio::Api api)
+{
+    static const char *apiString[] = {
+        "UNSPECIFIED",
+        "LINUX_ALSA",
+        "LINUX_PULSE",
+        "LINUX_OSS",
+        "UNIX_JACK",
+        "MACOSX_CORE",
+        "WINDOWS_WASAPI",
+        "WINDOWS_ASIO",
+        "WINDOWS_DS",
+        "RTAUDIO_DUMMY",
+        "UNKNOWN"
+    };
+
+    switch (api) {
+    case RtAudio::Api::UNSPECIFIED:
+        return apiString[0];
+    case RtAudio::Api::LINUX_ALSA:
+        return apiString[1];
+    case RtAudio::Api::LINUX_PULSE:
+        return apiString[2];
+    case RtAudio::Api::LINUX_OSS:
+        return apiString[3];
+    case RtAudio::Api::UNIX_JACK:
+        return apiString[4];
+    case RtAudio::Api::MACOSX_CORE:
+        return apiString[5];
+    case RtAudio::Api::WINDOWS_WASAPI:
+        return apiString[6];
+    case RtAudio::Api::WINDOWS_ASIO:
+        return apiString[7];
+    case RtAudio::Api::WINDOWS_DS:
+        return apiString[8];
+    case RtAudio::Api::RTAUDIO_DUMMY:
+        return apiString[9];
+    default:
+        return nullptr;
+    }
+
+    return nullptr;
+}
+
 int main(int argc, char *argv[])
 {
     args_t ARGS = {
@@ -356,6 +400,7 @@ int main(int argc, char *argv[])
     unsigned sampleRate = ARGS.sampleRate;
     unsigned bufferFrames = 256;
 
+    spdlog::get("stdout")->info("Current Audio API: {}", RtAudioApiToString(dac.getCurrentApi()));
     spdlog::get("stdout")->debug("nChannels: {}", streamParams.nChannels);
     spdlog::get("stdout")->debug("sampleRate: {}", sampleRate);
     spdlog::get("stdout")->debug("bufferFrames: {}", bufferFrames);
