@@ -43,6 +43,9 @@ int decodePacket(AVPacket *packet,
         return res;
     }
 
+    // init data
+    data.resize(isPlanarAudio ? codecCtx->channels : 1);
+
     while (res >= 0) {
         res = avcodec_receive_frame(codecCtx, frame);
         if (res == AVERROR(EAGAIN) || res == AVERROR_EOF) {
@@ -55,10 +58,10 @@ int decodePacket(AVPacket *packet,
         if (isPlanarAudio) {
             auto lineSize = frame->nb_samples * bytesPerSample;
             for (int i = 0; i < codecCtx->channels; ++i) {
-                data.emplace_back(frame->data[i], frame->data[i] + lineSize);
+                data[i].insert(data[i].end(), frame->data[i], frame->data[i] + lineSize);
             }
         } else {
-            data.emplace_back(frame->data[0], frame->data[0] + frame->linesize[0]);
+            data[0].insert(data[0].end(), frame->data[0], frame->data[0] + frame->linesize[0]);
         }
 
 #ifndef NDEBUG
