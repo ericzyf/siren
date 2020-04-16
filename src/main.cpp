@@ -6,7 +6,7 @@ extern "C" {
 }
 
 #include <fmt/format.h>
-#include <rtaudio/RtAudio.h>
+#include <portaudio.h>
 #include <spdlog/spdlog.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
 
@@ -16,7 +16,7 @@ extern "C" {
 #include <queue>
 #include <vector>
 
-struct RtAudioCbCtx {
+struct PaStreamCbCtx {
     AVCodecContext *codecCtx;
     AVFormatContext *fmtCtx;
     AVPacket *packet;
@@ -78,22 +78,17 @@ int decodePacket(AVPacket *packet,
     return 0;
 }
 
-int RtAudioCb(void *outputBuffer,
-         void *inputBuffer,
-         unsigned int nFrames,
-         double streamTime,
-         RtAudioStreamStatus status,
-         void *userData)
+int pa_stream_cb(const void *inputBuffer,
+                 void *outputBuffer,
+                 unsigned long frameCount,
+                 const PaStreamCallbackTimeInfo *timeInfo,
+                 PaStreamCallbackFlags statusFlags,
+                 void *userData)
 {
-    auto ctx = (RtAudioCbCtx*)userData;
+    auto ctx = (PaStreamCbCtx*)userData;
+    auto output = (uint8_t*)outputBuffer;
 
-    if (status) {
-        spdlog::get("stdout")->info("Stream underflow detected");
-    }
-
-    auto buffer = (uint8_t*)(outputBuffer);
-
-    while (ctx->frameQueue->size() < nFrames) {
+    while (ctx->frameQueue->size() < frameCount) {
         if (av_read_frame(ctx->fmtCtx, ctx->packet) >= 0) {
             if (ctx->packet->stream_index == ctx->audioStreamIndex) {
                 spdlog::get("stdout")->info("AVPacket->pts: {}", ctx->packet->pts);
@@ -109,7 +104,7 @@ int RtAudioCb(void *outputBuffer,
                         av_packet_unref(ctx->packet);
                         continue;
                     } else {
-                        return 1;
+                        return paComplete;
                     }
                 }
 
@@ -140,63 +135,65 @@ int RtAudioCb(void *outputBuffer,
             }
             av_packet_unref(ctx->packet);
         } else {
-            if (ctx->frameQueue->size() != 0) {
+            if (!ctx->frameQueue->empty()) {
                 // end of stream
                 // write remaining audio frames in frameQueue to outputBuffer
                 auto numRemFrames = ctx->frameQueue->size();
                 for (unsigned i = 0; i < numRemFrames; ++i) {
                     const auto &frame = ctx->frameQueue->front();
-                    memcpy(buffer, frame.data(), frame.size());
-                    buffer += frame.size();
+                    memcpy(output, frame.data(), frame.size());
+                    output += frame.size();
                     ctx->frameQueue->pop();
                 }
             }
             spdlog::get("stdout")->info("End of stream");
-            return 1;
+            return paComplete;
         }
     }
 
     // have enough audio frames in the frameQueue
     // write $nFrames frames to outputBuffer
-    unsigned maxNumFrames = std::min(nFrames, (unsigned)(ctx->frameQueue->size()));
-    for (unsigned i = 0; i < nFrames; ++i) {
+    auto maxNumFrames = std::min(frameCount, (decltype(frameCount))(ctx->frameQueue->size()));
+    for (decltype(maxNumFrames) i = 0; i < frameCount; ++i) {
         const auto &frame = ctx->frameQueue->front();
-        memcpy(buffer, frame.data(), frame.size());
-        buffer += frame.size();
+        memcpy(output, frame.data(), frame.size());
+        output += frame.size();
         ctx->frameQueue->pop();
     }
 
-    return 0;
+    return paContinue;
 }
 
-bool getRtAudioFormat(const AVCodecParameters *codecParams, RtAudioFormat &fmt)
+bool getPaSampleFormat(const AVCodecParameters *codecParams, PaSampleFormat &fmt)
 {
     switch (codecParams->format) {
 
+    case AV_SAMPLE_FMT_U8:
+    case AV_SAMPLE_FMT_U8P:
+        fmt = paUInt8;
+        return true;
+
     case AV_SAMPLE_FMT_S16:
     case AV_SAMPLE_FMT_S16P:
-        fmt = RTAUDIO_SINT16;
+        fmt = paInt16;
         return true;
 
     case AV_SAMPLE_FMT_S32:
     case AV_SAMPLE_FMT_S32P:
-        fmt = RTAUDIO_SINT32;
+        fmt = paInt32;
         return true;
 
     case AV_SAMPLE_FMT_FLT:
     case AV_SAMPLE_FMT_FLTP:
-        fmt = RTAUDIO_FLOAT32;
-        return true;
-
-    case AV_SAMPLE_FMT_DBL:
-    case AV_SAMPLE_FMT_DBLP:
-        fmt = RTAUDIO_FLOAT64;
+        fmt = paFloat32;
         return true;
 
     default:
         return false;
 
     }
+
+    return false;
 }
 
 struct args_t {
@@ -226,48 +223,13 @@ static void printHelp(const args_t &args)
     fmt::print("  -s <int> (default: {})  =  sample rate\n", args.sampleRate);
 }
 
-const char *RtAudioApiToString(RtAudio::Api api)
+void handlePaError(const PaError &err)
 {
-    static const char *apiString[] = {
-        "UNSPECIFIED",
-        "LINUX_ALSA",
-        "LINUX_PULSE",
-        "LINUX_OSS",
-        "UNIX_JACK",
-        "MACOSX_CORE",
-        "WINDOWS_WASAPI",
-        "WINDOWS_ASIO",
-        "WINDOWS_DS",
-        "RTAUDIO_DUMMY",
-        "UNKNOWN"
-    };
-
-    switch (api) {
-    case RtAudio::Api::UNSPECIFIED:
-        return apiString[0];
-    case RtAudio::Api::LINUX_ALSA:
-        return apiString[1];
-    case RtAudio::Api::LINUX_PULSE:
-        return apiString[2];
-    case RtAudio::Api::LINUX_OSS:
-        return apiString[3];
-    case RtAudio::Api::UNIX_JACK:
-        return apiString[4];
-    case RtAudio::Api::MACOSX_CORE:
-        return apiString[5];
-    case RtAudio::Api::WINDOWS_WASAPI:
-        return apiString[6];
-    case RtAudio::Api::WINDOWS_ASIO:
-        return apiString[7];
-    case RtAudio::Api::WINDOWS_DS:
-        return apiString[8];
-    case RtAudio::Api::RTAUDIO_DUMMY:
-        return apiString[9];
-    default:
-        return apiString[10];
-    }
-
-    return nullptr;
+    Pa_Terminate();
+    spdlog::get("stderr")->error("An error occurred while using the PortAudio stream");
+    spdlog::get("stderr")->error("Error number: {}", err);
+    spdlog::get("stderr")->error("Error message: {}", Pa_GetErrorText(err));
+    std::exit(EXIT_FAILURE);
 }
 
 int main(int argc, char *argv[])
@@ -378,66 +340,75 @@ int main(int argc, char *argv[])
         std::exit(EXIT_FAILURE);
     }
 
-    // init RtAudio
-    spdlog::get("stdout")->debug("Initializing RtAudio");
+    // init PortAudio
+    spdlog::get("stdout")->debug("Initializing PortAudio");
 
-    RtAudio dac(RtAudio::LINUX_PULSE);
-    if (dac.getDeviceCount() < 1) {
-        spdlog::get("stderr")->error("No audio devices found");
-        std::exit(EXIT_FAILURE);
-    }
+    unsigned long bufferFrames = 256;
 
-    RtAudio::StreamParameters streamParams;
-    streamParams.deviceId = dac.getDefaultOutputDevice();
-    streamParams.nChannels = codecParams->channels;
-
-    RtAudioFormat audioFmt;
-    if (!getRtAudioFormat(codecParams, audioFmt)) {
-        spdlog::get("stderr")->error("RtAudio error: unsupported audio format");
-        std::exit(EXIT_FAILURE);
-    }
-
-    unsigned sampleRate = ARGS.sampleRate;
-    unsigned bufferFrames = 256;
-
-    spdlog::get("stdout")->info("Current Audio API: {}", RtAudioApiToString(dac.getCurrentApi()));
-    spdlog::get("stdout")->debug("nChannels: {}", streamParams.nChannels);
-    spdlog::get("stdout")->debug("sampleRate: {}", sampleRate);
+    spdlog::get("stdout")->debug("nChannels: {}", codecCtx->channels);
+    spdlog::get("stdout")->debug("sampleRate: {}", ARGS.sampleRate);
     spdlog::get("stdout")->debug("bufferFrames: {}", bufferFrames);
+
+    PaStream *stream = nullptr;
+    PaError err;
+
+    err = Pa_Initialize();
+    if (err != paNoError) {
+        handlePaError(err);
+    }
+
+    PaSampleFormat sampleFmt;
+    if (!getPaSampleFormat(codecParams, sampleFmt)) {
+        spdlog::get("stderr")->error("PortAudio error: unsupported sample format");
+        std::exit(EXIT_FAILURE);
+    }
 
     std::queue<std::vector<uint8_t>> frameQueue;
 
-    RtAudioCbCtx ctx = {
+    PaStreamCbCtx pactx = {
         codecCtx,
         fmtCtx,
         packet,
         frame,
         &frameQueue,
         audioStreamIndex,
-        codecParams->channels
+        codecCtx->channels
     };
 
-    try {
-        dac.openStream(&streamParams, nullptr, audioFmt, sampleRate, &bufferFrames, RtAudioCb, &ctx);
-        dac.startStream();
-    } catch (RtAudioError &e) {
-        e.printMessage();
-        std::exit(EXIT_FAILURE);
+    err = Pa_OpenDefaultStream(
+        &stream,
+        0,
+        codecCtx->channels,
+        sampleFmt,
+        ARGS.sampleRate,
+        bufferFrames,
+        pa_stream_cb,
+        &pactx
+    );
+    if (err != paNoError) {
+        handlePaError(err);
+    }
+
+    err = Pa_StartStream(stream);
+    if (err != paNoError) {
+        handlePaError(err);
     }
 
     fmt::print("Playing ... press <Enter> to quit\n");
     char input;
     std::cin.get(input);
 
-    try {
-        dac.stopStream();
-    } catch (RtAudioError &e) {
-        e.printMessage();
+    err = Pa_StopStream(stream);
+    if (err != paNoError) {
+        handlePaError(err);
     }
 
-    if (dac.isStreamOpen()) {
-        dac.closeStream();
+    err = Pa_CloseStream(stream);
+    if (err != paNoError) {
+        handlePaError(err);
     }
+
+    Pa_Terminate();
 
     spdlog::get("stdout")->debug("Releasing resources");
     av_packet_free(&packet);
