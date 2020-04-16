@@ -264,7 +264,7 @@ const char *RtAudioApiToString(RtAudio::Api api)
     case RtAudio::Api::RTAUDIO_DUMMY:
         return apiString[9];
     default:
-        return nullptr;
+        return apiString[10];
     }
 
     return nullptr;
