@@ -357,6 +357,9 @@ int main(int argc, char *argv[])
         handlePaError(err);
     }
 
+    auto hostApiInfo = Pa_GetHostApiInfo(Pa_GetDefaultHostApi());
+    spdlog::get("stdout")->info("Current audio API: {}", hostApiInfo->name);
+
     PaSampleFormat sampleFmt;
     if (!getPaSampleFormat(codecParams, sampleFmt)) {
         spdlog::get("stderr")->error("PortAudio error: unsupported sample format");
