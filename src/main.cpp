@@ -1,10 +1,9 @@
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
-
-#include <unistd.h>
 }
 
+#include <cxxopts.hpp>
 #include <fmt/format.h>
 #include <portaudio.h>
 #include <spdlog/spdlog.h>
@@ -196,33 +195,6 @@ bool getPaSampleFormat(const AVCodecParameters *codecParams, PaSampleFormat &fmt
     return false;
 }
 
-struct args_t {
-    int verbosity;
-    int sampleRate;
-    const char *audioPath;
-};
-
-static void printHelp(const args_t &args)
-{
-    fmt::print("Usage:\n");
-    fmt::print("\n");
-    fmt::print("  siren [options] <path-to-audio>\n");
-    fmt::print("\n");
-    fmt::print("\n");
-    fmt::print("Options:\n");
-    fmt::print("\n");
-    fmt::print("  -h  =  help\n");
-    fmt::print("  -v <int> (default: {})  =  verbosity\n", args.verbosity);
-    fmt::print("    trace={}\n", (int)spdlog::level::trace);
-    fmt::print("    debug={}\n", (int)spdlog::level::debug);
-    fmt::print("    info={}\n", (int)spdlog::level::info);
-    fmt::print("    warn={}\n", (int)spdlog::level::warn);
-    fmt::print("    error={}\n", (int)spdlog::level::err);
-    fmt::print("    critical={}\n", (int)spdlog::level::critical);
-    fmt::print("    off={}\n", (int)spdlog::level::off);
-    fmt::print("  -s <int> (default: {})  =  sample rate\n", args.sampleRate);
-}
-
 void handlePaError(const PaError &err)
 {
     Pa_Terminate();
@@ -234,38 +206,45 @@ void handlePaError(const PaError &err)
 
 int main(int argc, char *argv[])
 {
-    args_t ARGS = {
-        .verbosity = spdlog::level::info,
-        .sampleRate = 44100,
-        .audioPath = nullptr
-    };
-
     // parse args
-    if (argc == 1) {
-        printHelp(ARGS);
-        return 0;
-    }
+    std::string arg_file;
+    int arg_verbosity;
+    int arg_samplerate;
 
-    opterr = 0;
-    int c;
-    while ((c = getopt(argc, argv, "hv:s:")) != -1) {
-        switch (c) {
-        case 'h':
-            printHelp(ARGS);
+    try {
+        cxxopts::Options options("siren");
+        options.add_options()
+            ("h,help", "Show help")
+            ("f,file", "Path to the audio file", cxxopts::value<std::string>())
+            ("v,verbosity", "Set log verbosity(0~6)", cxxopts::value<int>()->default_value("2"))
+            ("s,samplerate", "Set sample rate", cxxopts::value<int>()->default_value("44100"))
+        ;
+
+        if (argc == 1) {
+            std::cout << options.help() << std::endl;
             return 0;
-        case 'v':
-            ARGS.verbosity = std::atoi(optarg);
-            break;
-        case 's':
-            ARGS.sampleRate = std::atoi(optarg);
-            break;
         }
-    }
-    if (!argv[optind]) {
-        fmt::print("Missing path to audio file\n");
+
+        auto parseResult = options.parse(argc, argv);
+
+        if (parseResult.count("help")) {
+            std::cout << options.help() << std::endl;
+            return 0;
+        }
+
+        if (parseResult.count("file")) {
+            arg_file = parseResult["file"].as<std::string>();
+        } else {
+            std::cerr << "Please specify the path to audio file" << std::endl;
+            std::exit(EXIT_FAILURE);
+        }
+
+        arg_verbosity = parseResult["verbosity"].as<int>();
+        arg_samplerate = parseResult["samplerate"].as<int>();
+    } catch (const cxxopts::OptionException &e) {
+        std::cerr << "Error parsing args" << std::endl;
+        std::cerr << e.what() << std::endl;
         std::exit(EXIT_FAILURE);
-    } else {
-        ARGS.audioPath = argv[optind];
     }
     // finish parsing args
     //////////////////////
@@ -273,8 +252,8 @@ int main(int argc, char *argv[])
     auto spdlog_stdout = spdlog::stdout_color_st("stdout");
     auto spdlog_stderr = spdlog::stderr_color_st("stderr");
 
-    spdlog_stdout->set_level((spdlog::level::level_enum)ARGS.verbosity);
-    spdlog_stderr->set_level((spdlog::level::level_enum)ARGS.verbosity);
+    spdlog_stdout->set_level((spdlog::level::level_enum)arg_verbosity);
+    spdlog_stderr->set_level((spdlog::level::level_enum)arg_verbosity);
 
     AVFormatContext *fmtCtx = avformat_alloc_context();
     if (!fmtCtx) {
@@ -282,8 +261,8 @@ int main(int argc, char *argv[])
         std::exit(EXIT_FAILURE);
     }
 
-    if (avformat_open_input(&fmtCtx, ARGS.audioPath, nullptr, nullptr)) {
-        spdlog::get("stderr")->error("Could not open file \"{}\"", ARGS.audioPath);
+    if (avformat_open_input(&fmtCtx, arg_file.c_str(), nullptr, nullptr)) {
+        spdlog::get("stderr")->error("Could not open file \"{}\"", arg_file.c_str());
         std::exit(EXIT_FAILURE);
     }
 
@@ -346,7 +325,7 @@ int main(int argc, char *argv[])
     unsigned long bufferFrames = 256;
 
     spdlog::get("stdout")->debug("nChannels: {}", codecCtx->channels);
-    spdlog::get("stdout")->debug("sampleRate: {}", ARGS.sampleRate);
+    spdlog::get("stdout")->debug("sampleRate: {}", arg_samplerate);
     spdlog::get("stdout")->debug("bufferFrames: {}", bufferFrames);
 
     PaStream *stream = nullptr;
@@ -383,7 +362,7 @@ int main(int argc, char *argv[])
         0,
         codecCtx->channels,
         sampleFmt,
-        ARGS.sampleRate,
+        arg_samplerate,
         bufferFrames,
         pa_stream_cb,
         &pactx
