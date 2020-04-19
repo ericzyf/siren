@@ -211,6 +211,7 @@ int main(int argc, char *argv[])
     std::string arg_file;
     int arg_verbosity;
     int arg_samplerate;
+    unsigned long arg_bufferframes;
 
     try {
         cxxopts::Options options("siren");
@@ -219,6 +220,7 @@ int main(int argc, char *argv[])
             ("f,file", "Path to the audio file", cxxopts::value<std::string>())
             ("v,verbosity", "Set log verbosity(0~6)", cxxopts::value<int>()->default_value("2"))
             ("s,samplerate", "Set sample rate(0: auto)", cxxopts::value<int>()->default_value("0"))
+            ("b,bufferframes", "Set number of buffer frames", cxxopts::value<unsigned long>()->default_value("512"))
         ;
 
         if (argc == 1) {
@@ -242,6 +244,7 @@ int main(int argc, char *argv[])
 
         arg_verbosity = parseResult["verbosity"].as<int>();
         arg_samplerate = parseResult["samplerate"].as<int>();
+        arg_bufferframes = parseResult["bufferframes"].as<unsigned long>();
     } catch (const cxxopts::OptionException &e) {
         std::cerr << "Error parsing args" << std::endl;
         std::cerr << e.what() << std::endl;
@@ -323,12 +326,11 @@ int main(int argc, char *argv[])
     // init PortAudio
     spdlog::get("stdout")->debug("Initializing PortAudio");
 
-    unsigned long bufferFrames = 256;
     int sampleRate = (arg_samplerate == 0) ? codecParams->sample_rate : arg_samplerate;
 
     spdlog::get("stdout")->debug("nChannels: {}", codecCtx->channels);
     spdlog::get("stdout")->debug("sampleRate: {}", sampleRate);
-    spdlog::get("stdout")->debug("bufferFrames: {}", bufferFrames);
+    spdlog::get("stdout")->debug("bufferFrames: {}", arg_bufferframes);
 
     PaStream *stream = nullptr;
     PaError err;
@@ -365,7 +367,7 @@ int main(int argc, char *argv[])
         codecCtx->channels,
         sampleFmt,
         sampleRate,
-        bufferFrames,
+        arg_bufferframes,
         pa_stream_cb,
         &pactx
     );
