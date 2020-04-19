@@ -217,7 +217,7 @@ int main(int argc, char *argv[])
             ("h,help", "Show help")
             ("f,file", "Path to the audio file", cxxopts::value<std::string>())
             ("v,verbosity", "Set log verbosity(0~6)", cxxopts::value<int>()->default_value("2"))
-            ("s,samplerate", "Set sample rate", cxxopts::value<int>()->default_value("44100"))
+            ("s,samplerate", "Set sample rate(0: auto)", cxxopts::value<int>()->default_value("0"))
         ;
 
         if (argc == 1) {
@@ -323,9 +323,10 @@ int main(int argc, char *argv[])
     spdlog::get("stdout")->debug("Initializing PortAudio");
 
     unsigned long bufferFrames = 256;
+    int sampleRate = (arg_samplerate == 0) ? codecParams->sample_rate : arg_samplerate;
 
     spdlog::get("stdout")->debug("nChannels: {}", codecCtx->channels);
-    spdlog::get("stdout")->debug("sampleRate: {}", arg_samplerate);
+    spdlog::get("stdout")->debug("sampleRate: {}", sampleRate);
     spdlog::get("stdout")->debug("bufferFrames: {}", bufferFrames);
 
     PaStream *stream = nullptr;
@@ -362,7 +363,7 @@ int main(int argc, char *argv[])
         0,
         codecCtx->channels,
         sampleFmt,
-        arg_samplerate,
+        sampleRate,
         bufferFrames,
         pa_stream_cb,
         &pactx
