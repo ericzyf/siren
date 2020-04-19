@@ -60,7 +60,8 @@ int decodePacket(AVPacket *packet,
                 data[i].insert(data[i].end(), frame->data[i], frame->data[i] + lineSize);
             }
         } else {
-            data[0].insert(data[0].end(), frame->data[0], frame->data[0] + frame->linesize[0]);
+            auto lineSize = frame->nb_samples * bytesPerSample * codecCtx->channels;
+            data[0].insert(data[0].end(), frame->data[0], frame->data[0] + lineSize);
         }
 
 #ifndef NDEBUG
