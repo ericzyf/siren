@@ -205,6 +205,23 @@ void handlePaError(const PaError &err)
     std::exit(EXIT_FAILURE);
 }
 
+void listHostApiInfo()
+{
+    PaError err = Pa_Initialize();
+    if (err != paNoError) {
+        handlePaError(err);
+    }
+
+    int apiCount = Pa_GetHostApiCount();
+    fmt::print("HostApiCount: {}\n", apiCount);
+    for (int i = 0; i < apiCount; ++i) {
+        auto info = Pa_GetHostApiInfo(i);
+        fmt::print("[{}] {}\n", i, info->name);
+    }
+
+    Pa_Terminate();
+}
+
 int main(int argc, char *argv[])
 {
     // parse args
@@ -221,6 +238,7 @@ int main(int argc, char *argv[])
             ("v,verbosity", "Set log verbosity(0~6)", cxxopts::value<int>()->default_value("2"))
             ("s,samplerate", "Set sample rate(0: auto)", cxxopts::value<int>()->default_value("0"))
             ("b,bufferframes", "Set number of buffer frames", cxxopts::value<unsigned long>()->default_value("512"))
+            ("listhostapi", "List host audio API")
         ;
 
         if (argc == 1) {
@@ -232,6 +250,11 @@ int main(int argc, char *argv[])
 
         if (parseResult.count("help")) {
             std::cout << options.help() << std::endl;
+            return 0;
+        }
+
+        if (parseResult.count("listhostapi")) {
+            listHostApiInfo();
             return 0;
         }
 
