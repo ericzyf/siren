@@ -10,8 +10,10 @@ extern "C" {
 #include <cxxopts.hpp>
 
 #include <cinttypes>
+#include <condition_variable>
 #include <cstdlib>
 #include <iostream>
+#include <mutex>
 #include <queue>
 #include <vector>
 
@@ -20,13 +22,16 @@ struct PaStreamCbCtx {
   AVFormatContext *fmtCtx;
   AVPacket *packet;
   AVFrame *frame;
-  std::queue<std::vector<uint8_t>> *frameQueue;
+  std::queue<std::vector<std::uint8_t>> *frameQueue;
   int audioStreamIndex;
   int numChannels;
+  std::mutex *cvm;
+  std::condition_variable *cv;
+  int *streamCallbackResult;
 };
 
 int decodePacket(AVPacket *packet, AVCodecContext *codecCtx, AVFrame *frame,
-                 std::vector<std::vector<uint8_t>> &data)
+                 std::vector<std::vector<std::uint8_t>> &data)
 {
   bool isPlanarAudio = av_sample_fmt_is_planar(codecCtx->sample_fmt);
   int bytesPerSample = av_get_bytes_per_sample(codecCtx->sample_fmt);
@@ -82,13 +87,15 @@ int pa_stream_cb(const void *inputBuffer, void *outputBuffer,
                  PaStreamCallbackFlags statusFlags, void *userData)
 {
   auto ctx = (PaStreamCbCtx *)userData;
-  auto output = (uint8_t *)outputBuffer;
+  std::lock_guard<std::mutex> lg(*ctx->cvm);
+
+  auto output = (std::uint8_t *)outputBuffer;
 
   while (ctx->frameQueue->size() < frameCount) {
     if (av_read_frame(ctx->fmtCtx, ctx->packet) >= 0) {
       if (ctx->packet->stream_index == ctx->audioStreamIndex) {
         spdlog::get("stdout")->info("AVPacket->pts: {}", ctx->packet->pts);
-        std::vector<std::vector<uint8_t>> packetData;
+        std::vector<std::vector<std::uint8_t>> packetData;
         int ret =
             decodePacket(ctx->packet, ctx->codecCtx, ctx->frame, packetData);
         if (ret < 0) {
@@ -99,6 +106,8 @@ int pa_stream_cb(const void *inputBuffer, void *outputBuffer,
             av_packet_unref(ctx->packet);
             continue;
           } else {
+            *ctx->streamCallbackResult = paComplete;
+            ctx->cv->notify_one();
             return paComplete;
           }
         }
@@ -109,7 +118,8 @@ int pa_stream_cb(const void *inputBuffer, void *outputBuffer,
             av_get_bytes_per_sample(ctx->codecCtx->sample_fmt);
 
         if (isPlanarAudio) {
-          std::vector<uint8_t> currSample(ctx->numChannels * bytesPerSample);
+          std::vector<std::uint8_t> currSample(ctx->numChannels *
+                                               bytesPerSample);
           for (unsigned offset = 0; offset < packetData[0].size();
                offset += bytesPerSample) {
             auto pSample = currSample.data();
@@ -124,7 +134,7 @@ int pa_stream_cb(const void *inputBuffer, void *outputBuffer,
         } else {
           // data is already interleaved
           auto step = ctx->numChannels * bytesPerSample;
-          std::vector<uint8_t> currSample(step);
+          std::vector<std::uint8_t> currSample(step);
           for (unsigned offset = 0; offset < packetData[0].size();
                offset += step) {
             memcpy(currSample.data(), packetData[0].data() + offset, step);
@@ -146,6 +156,8 @@ int pa_stream_cb(const void *inputBuffer, void *outputBuffer,
         }
       }
       spdlog::get("stdout")->info("End of stream");
+      *ctx->streamCallbackResult = paComplete;
+      ctx->cv->notify_one();
       return paComplete;
     }
   }
@@ -222,6 +234,158 @@ void listHostApiInfo()
   Pa_Terminate();
 }
 
+void playAudio(const char *path, int sampleRate, unsigned long bufferFrames)
+{
+  if (!path) {
+    return;
+  }
+
+  AVFormatContext *fmtCtx = avformat_alloc_context();
+  if (!fmtCtx) {
+    spdlog::get("stderr")->error(
+        "Failed to allocate memory for format context");
+    std::exit(EXIT_FAILURE);
+  }
+
+  if (avformat_open_input(&fmtCtx, path, nullptr, nullptr)) {
+    spdlog::get("stderr")->error("Could not open file \"{}\"", path);
+    std::exit(EXIT_FAILURE);
+  }
+
+  if (avformat_find_stream_info(fmtCtx, nullptr) < 0) {
+    spdlog::get("stderr")->error("Could not get stream info");
+    std::exit(EXIT_FAILURE);
+  }
+
+  int audioStreamIndex = -1;
+  for (int i = 0; i < fmtCtx->nb_streams; ++i) {
+    if (fmtCtx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
+      audioStreamIndex = i;
+      break;
+    }
+  }
+
+  if (audioStreamIndex == -1) {
+    spdlog::get("stderr")->error("Could not find audio stream");
+    std::exit(EXIT_FAILURE);
+  }
+
+  AVCodecParameters *codecParams = fmtCtx->streams[audioStreamIndex]->codecpar;
+  AVCodec *codec = avcodec_find_decoder(codecParams->codec_id);
+  if (!codec) {
+    spdlog::get("stderr")->error("Could not find codec");
+    std::exit(EXIT_FAILURE);
+  }
+
+  AVCodecContext *codecCtx = avcodec_alloc_context3(codec);
+  if (!codecCtx) {
+    spdlog::get("stderr")->error("Failed to allocate memory for codec context");
+    std::exit(EXIT_FAILURE);
+  }
+
+  if (avcodec_parameters_to_context(codecCtx, codecParams) < 0) {
+    spdlog::get("stderr")->error(
+        "Failed to copy codec params to codec context");
+    std::exit(EXIT_FAILURE);
+  }
+
+  if (avcodec_open2(codecCtx, codec, nullptr) < 0) {
+    spdlog::get("stderr")->error("Failed to open codec through avcodec_open2");
+    std::exit(EXIT_FAILURE);
+  }
+
+  AVFrame *frame = av_frame_alloc();
+  if (!frame) {
+    spdlog::get("stderr")->error("Failed to allocate memory for AVFrame");
+    std::exit(EXIT_FAILURE);
+  }
+
+  AVPacket *packet = av_packet_alloc();
+  if (!packet) {
+    spdlog::get("stderr")->error("Failed to allocate memory for AVPacket");
+    std::exit(EXIT_FAILURE);
+  }
+
+  // init PortAudio
+  spdlog::get("stdout")->debug("Initializing PortAudio");
+
+  if (sampleRate == 0) {
+    sampleRate = codecParams->sample_rate;
+  }
+
+  spdlog::get("stdout")->debug("nChannels: {}", codecCtx->channels);
+  spdlog::get("stdout")->debug("sampleRate: {}", sampleRate);
+  spdlog::get("stdout")->debug("bufferFrames: {}", bufferFrames);
+
+  PaStream *stream = nullptr;
+  PaError err;
+
+  err = Pa_Initialize();
+  if (err != paNoError) {
+    handlePaError(err);
+  }
+
+  auto hostApiInfo = Pa_GetHostApiInfo(Pa_GetDefaultHostApi());
+  spdlog::get("stdout")->info("Current audio API: {}", hostApiInfo->name);
+
+  PaSampleFormat sampleFmt;
+  if (!getPaSampleFormat(codecParams, sampleFmt)) {
+    spdlog::get("stderr")->error("PortAudio error: unsupported sample format");
+    std::exit(EXIT_FAILURE);
+  }
+
+  std::queue<std::vector<std::uint8_t>> frameQueue;
+
+  std::mutex cvm;
+  std::condition_variable cv;
+  int streamCallbackResult = paContinue;
+
+  PaStreamCbCtx pactx = {codecCtx,
+                         fmtCtx,
+                         packet,
+                         frame,
+                         &frameQueue,
+                         audioStreamIndex,
+                         codecCtx->channels,
+                         &cvm,
+                         &cv,
+                         &streamCallbackResult};
+
+  err = Pa_OpenDefaultStream(&stream, 0, codecCtx->channels, sampleFmt,
+                             sampleRate, bufferFrames, pa_stream_cb, &pactx);
+  if (err != paNoError) {
+    handlePaError(err);
+  }
+
+  err = Pa_StartStream(stream);
+  if (err != paNoError) {
+    handlePaError(err);
+  }
+
+  {
+    std::unique_lock<std::mutex> lk(cvm);
+    cv.wait(lk, [&] { return streamCallbackResult != paContinue; });
+  }
+
+  err = Pa_StopStream(stream);
+  if (err != paNoError) {
+    handlePaError(err);
+  }
+
+  err = Pa_CloseStream(stream);
+  if (err != paNoError) {
+    handlePaError(err);
+  }
+
+  Pa_Terminate();
+
+  spdlog::get("stdout")->debug("Releasing resources");
+  av_packet_free(&packet);
+  av_frame_free(&frame);
+  avcodec_free_context(&codecCtx);
+  avformat_close_input(&fmtCtx);
+}
+
 int main(int argc, char *argv[])
 {
   // parse args
@@ -285,139 +449,7 @@ int main(int argc, char *argv[])
   spdlog_stdout->set_level((spdlog::level::level_enum)arg_verbosity);
   spdlog_stderr->set_level((spdlog::level::level_enum)arg_verbosity);
 
-  AVFormatContext *fmtCtx = avformat_alloc_context();
-  if (!fmtCtx) {
-    spdlog::get("stderr")->error(
-        "Failed to allocate memory for format context");
-    std::exit(EXIT_FAILURE);
-  }
-
-  if (avformat_open_input(&fmtCtx, arg_file.c_str(), nullptr, nullptr)) {
-    spdlog::get("stderr")->error("Could not open file \"{}\"",
-                                 arg_file.c_str());
-    std::exit(EXIT_FAILURE);
-  }
-
-  if (avformat_find_stream_info(fmtCtx, nullptr) < 0) {
-    spdlog::get("stderr")->error("Could not get stream info");
-    std::exit(EXIT_FAILURE);
-  }
-
-  int audioStreamIndex = -1;
-  for (int i = 0; i < fmtCtx->nb_streams; ++i) {
-    if (fmtCtx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
-      audioStreamIndex = i;
-      break;
-    }
-  }
-
-  if (audioStreamIndex == -1) {
-    spdlog::get("stderr")->error("Could not find audio stream");
-    std::exit(EXIT_FAILURE);
-  }
-
-  AVCodecParameters *codecParams = fmtCtx->streams[audioStreamIndex]->codecpar;
-  AVCodec *codec = avcodec_find_decoder(codecParams->codec_id);
-  if (!codec) {
-    spdlog::get("stderr")->error("Could not find codec");
-    std::exit(EXIT_FAILURE);
-  }
-
-  AVCodecContext *codecCtx = avcodec_alloc_context3(codec);
-  if (!codecCtx) {
-    spdlog::get("stderr")->error("Failed to allocate memory for codec context");
-    std::exit(EXIT_FAILURE);
-  }
-
-  if (avcodec_parameters_to_context(codecCtx, codecParams) < 0) {
-    spdlog::get("stderr")->error(
-        "Failed to copy codec params to codec context");
-    std::exit(EXIT_FAILURE);
-  }
-
-  if (avcodec_open2(codecCtx, codec, nullptr) < 0) {
-    spdlog::get("stderr")->error("Failed to open codec through avcodec_open2");
-    std::exit(EXIT_FAILURE);
-  }
-
-  AVFrame *frame = av_frame_alloc();
-  if (!frame) {
-    spdlog::get("stderr")->error("Failed to allocate memory for AVFrame");
-    std::exit(EXIT_FAILURE);
-  }
-
-  AVPacket *packet = av_packet_alloc();
-  if (!packet) {
-    spdlog::get("stderr")->error("Failed to allocate memory for AVPacket");
-    std::exit(EXIT_FAILURE);
-  }
-
-  // init PortAudio
-  spdlog::get("stdout")->debug("Initializing PortAudio");
-
-  int sampleRate =
-      (arg_samplerate == 0) ? codecParams->sample_rate : arg_samplerate;
-
-  spdlog::get("stdout")->debug("nChannels: {}", codecCtx->channels);
-  spdlog::get("stdout")->debug("sampleRate: {}", sampleRate);
-  spdlog::get("stdout")->debug("bufferFrames: {}", arg_bufferframes);
-
-  PaStream *stream = nullptr;
-  PaError err;
-
-  err = Pa_Initialize();
-  if (err != paNoError) {
-    handlePaError(err);
-  }
-
-  auto hostApiInfo = Pa_GetHostApiInfo(Pa_GetDefaultHostApi());
-  spdlog::get("stdout")->info("Current audio API: {}", hostApiInfo->name);
-
-  PaSampleFormat sampleFmt;
-  if (!getPaSampleFormat(codecParams, sampleFmt)) {
-    spdlog::get("stderr")->error("PortAudio error: unsupported sample format");
-    std::exit(EXIT_FAILURE);
-  }
-
-  std::queue<std::vector<uint8_t>> frameQueue;
-
-  PaStreamCbCtx pactx = {
-      codecCtx,          fmtCtx, packet, frame, &frameQueue, audioStreamIndex,
-      codecCtx->channels};
-
-  err =
-      Pa_OpenDefaultStream(&stream, 0, codecCtx->channels, sampleFmt,
-                           sampleRate, arg_bufferframes, pa_stream_cb, &pactx);
-  if (err != paNoError) {
-    handlePaError(err);
-  }
-
-  err = Pa_StartStream(stream);
-  if (err != paNoError) {
-    handlePaError(err);
-  }
-
-  fmt::print("Playing ... press <Enter> to quit\n");
-  char input;
-  std::cin.get(input);
-
-  err = Pa_StopStream(stream);
-  if (err != paNoError) {
-    handlePaError(err);
-  }
-
-  err = Pa_CloseStream(stream);
-  if (err != paNoError) {
-    handlePaError(err);
-  }
-
-  Pa_Terminate();
-
-  spdlog::get("stdout")->debug("Releasing resources");
-  av_packet_free(&packet);
-  av_frame_free(&frame);
-  avcodec_free_context(&codecCtx);
-  avformat_close_input(&fmtCtx);
+  playAudio(arg_file.c_str(), arg_samplerate, arg_bufferframes);
 
   return 0;
 }
